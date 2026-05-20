@@ -744,6 +744,12 @@ class BaseModelClass(metaclass=BaseModelMetaClass):
         Model files are not expected to be reproducibly saved and loaded across versions
         until we reach version 1.0.
 
+        To resume training with the optimizer state preserved, use the
+        :class:`~scvi.train.SaveCheckpoint` callback which saves a Lightning checkpoint
+        (including optimizer state) alongside the model save. The Lightning checkpoint path
+        can be accessed via the ``best_ckpt_path`` property on the callback and passed as
+        ``ckpt_path`` to :meth:`train`.
+
         Parameters
         ----------
         dir_path
