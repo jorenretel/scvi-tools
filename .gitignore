@@ -18,6 +18,8 @@ __pycache__/
 /.pytest_cache/
 /.cache/
 /data/
+/checkpoints/
+/scvi_log/
 
 # docs
 /docs/generated/
