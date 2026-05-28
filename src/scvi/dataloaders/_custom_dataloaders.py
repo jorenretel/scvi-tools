@@ -456,8 +456,14 @@ class MappedCollectionMultiVIDataModule(LightningDataModule):
         Additional categorical covariate keys from ``.obs``.
     batch_size
         Minibatch size for training.
+    train_size
+        Fraction of data used for training when ``collection_val`` is not provided.
+        The remaining fraction is used for validation. Set to 1.0 to disable splitting.
+    seed
+        Random seed for reproducible train/validation splitting.
     collection_val
-        Optional separate collection for validation.
+        Optional separate collection for validation. When provided, ``train_size``
+        is ignored and the full ``collection`` is used for training.
     accelerator
         Lightning accelerator string.
     device
@@ -477,6 +483,8 @@ class MappedCollectionMultiVIDataModule(LightningDataModule):
         batch_key: str,
         categorical_covariate_keys: list[str] | None = None,
         batch_size: int = 128,
+        train_size: float = 0.9,
+        seed: int = 0,
         collection_val: ln.Collection | None = None,
         accelerator: str = "auto",
         device: int | str = "auto",
@@ -499,12 +507,29 @@ class MappedCollectionMultiVIDataModule(LightningDataModule):
         self._dataset = collection.mapped(
             obs_keys=obs_keys, parallel=self._parallel, **kwargs
         )
+
+        # Handle train/val splitting
         if collection_val is not None:
+            # Use separate collection for validation
             self._validset = collection_val.mapped(
                 obs_keys=obs_keys, parallel=self._parallel, **kwargs
             )
-        else:
+            self._train_indices = None
+            self._val_indices = None
+        elif train_size < 1.0:
+            # Random split of the single collection
+            n = self._dataset.n_obs
+            rng = np.random.default_rng(seed)
+            indices = rng.permutation(n)
+            n_train = int(n * train_size)
+            self._train_indices = indices[:n_train]
+            self._val_indices = indices[n_train:]
             self._validset = None
+        else:
+            # No validation
+            self._validset = None
+            self._train_indices = None
+            self._val_indices = None
 
         if categorical_covariate_keys is not None:
             self._categorical_covariate_encoders = [
@@ -523,11 +548,17 @@ class MappedCollectionMultiVIDataModule(LightningDataModule):
             self._validset.close()
 
     def train_dataloader(self) -> DataLoader:
-        return self._create_dataloader(self._dataset, shuffle=self.shuffle)
+        dataset = self._dataset
+        if self._train_indices is not None:
+            dataset = dataset[self._train_indices]
+        return self._create_dataloader(dataset, shuffle=self.shuffle)
 
     def val_dataloader(self) -> DataLoader | None:
         if self._validset is not None:
             return self._create_dataloader(self._validset, shuffle=False)
+        if self._val_indices is not None:
+            dataset = self._dataset[self._val_indices]
+            return self._create_dataloader(dataset, shuffle=False)
         return None
 
     def _create_dataloader(self, dataset, shuffle: bool, batch_size: int | None = None):
