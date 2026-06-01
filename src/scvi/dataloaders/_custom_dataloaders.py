@@ -562,11 +562,10 @@ class MappedCollectionMultiVIDataModule(LightningDataModule):
         return None
 
     def _create_dataloader(self, dataset, shuffle: bool, batch_size: int | None = None):
-        if self._parallel:
-            num_workers = os.cpu_count() - 1
+        num_workers = scvi.settings.dl_num_workers
+        if num_workers > 0 and self._parallel:
             worker_init_fn = dataset.torch_worker_init_fn
         else:
-            num_workers = 0
             worker_init_fn = None
         return DataLoader(
             dataset,
