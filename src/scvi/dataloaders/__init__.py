@@ -5,6 +5,7 @@ from ._ann_dataloader import AnnDataLoader
 from ._anncollection import CollectionAdapter
 from ._concat_dataloader import ConcatDataLoader
 from ._custom_dataloaders import (
+    AnnbatchDataModule,
     MappedCollectionDataModule,
     MappedCollectionMultiVIDataModule,
     TileDBDataModule,
@@ -27,6 +28,7 @@ __all__ = [
     "DataSplitter",
     "SemiSupervisedDataSplitter",
     "BatchDistributedSampler",
+    "AnnbatchDataModule",
     "MappedCollectionDataModule",
     "MappedCollectionMultiVIDataModule",
     "TileDBDataModule",
