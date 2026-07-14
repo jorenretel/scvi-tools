@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from anndata import AnnData
+    from lightning.pytorch import LightningDataModule
     from torch import Tensor
 
     from scvi._types import AnnOrMuData, Number
@@ -141,7 +142,7 @@ class MULTIVI(
 
     def __init__(
         self,
-        adata: AnnOrMuData,
+        adata: AnnOrMuData | None = None,
         n_genes: int | None = None,
         n_regions: int | None = None,
         modality_weights: Literal["equal", "cell", "universal"] = "equal",
@@ -161,9 +162,47 @@ class MULTIVI(
         encode_covariates: bool = False,
         fully_paired: bool = False,
         protein_dispersion: Literal["protein", "protein-batch", "protein-label"] = "protein",
+        registry: dict | None = None,
         **model_kwargs,
     ):
-        super().__init__(adata)
+        super().__init__(adata, registry)
+
+        # Store module kwargs for deferred init when using a datamodule
+        self._module_kwargs = {
+            "modality_weights": modality_weights,
+            "modality_penalty": modality_penalty,
+            "n_hidden": n_hidden,
+            "n_latent": n_latent,
+            "n_layers_encoder": n_layers_encoder,
+            "n_layers_decoder": n_layers_decoder,
+            "dropout_rate": dropout_rate,
+            "region_factors": region_factors,
+            "gene_likelihood": gene_likelihood,
+            "gene_dispersion": dispersion,
+            "use_batch_norm": use_batch_norm,
+            "use_layer_norm": use_layer_norm,
+            "latent_distribution": latent_distribution,
+            "deeply_inject_covariates": deeply_inject_covariates,
+            "encode_covariates": encode_covariates,
+            "protein_dispersion": protein_dispersion,
+            **model_kwargs,
+        }
+
+        if adata is None and registry is not None:
+            # Deferred module init: module will be created at train() time
+            self.module = None
+            self.fully_paired = fully_paired
+            self.n_latent = n_latent
+            self.n_genes = n_genes
+            self.n_regions = n_regions
+            self.n_proteins = 0
+            self._model_summary_string = (
+                "MultiVI Model (deferred init from registry/datamodule)"
+            )
+            self.init_params_ = self._get_init_params(locals())
+            self.get_normalized_function_name = "get_normalized_accessibility"
+            return
+
         if "n_proteins" in self.summary_stats:
             self.protein_state_registry = self.adata_manager.get_state_registry(
                 REGISTRY_KEYS.PROTEIN_EXP_KEY
@@ -258,6 +297,7 @@ class MULTIVI(
         adversarial_mixing: bool = True,
         datasplitter_kwargs: dict | None = None,
         plan_kwargs: dict | None = None,
+        datamodule: LightningDataModule | None = None,
         **kwargs,
     ):
         """Trains the model using amortized variational inference.
@@ -305,6 +345,11 @@ class MULTIVI(
         plan_kwargs
             Keyword args for :class:`~scvi.train.TrainingPlan`. Keyword arguments passed to
             `train()` will overwrite values present in `plan_kwargs`, when appropriate.
+        datamodule
+            A PyTorch Lightning DataModule (e.g.,
+            :class:`~scvi.dataloaders.MappedCollectionMultiVIDataModule`) to use instead of
+            the default :class:`~scvi.dataloaders.DataSplitter`. When provided, the model module
+            will be constructed from the datamodule metadata if not already initialized.
         **kwargs
             Other keyword args for :class:`~scvi.train.Trainer`.
         """
@@ -320,6 +365,35 @@ class MULTIVI(
         }
         plan_kwargs = merge_kwargs(None, plan_kwargs, name="plan")
         plan_kwargs.update(update_dict)
+
+        if datamodule is not None:
+            # Use externally-provided datamodule (e.g. LaminDB streaming)
+            if self.module is None:
+                self._module_kwargs.update(
+                    {
+                        "n_input_genes": datamodule.n_genes,
+                        "n_input_regions": datamodule.n_regions,
+                        "n_batch": datamodule.n_batch,
+                        "n_cats_per_cov": datamodule.n_cats_per_cov,
+                    }
+                )
+                self.module = self._module_cls(**self._module_kwargs)
+
+            training_plan = self._training_plan_cls(self.module, **plan_kwargs)
+            runner = self._train_runner_cls(
+                self,
+                training_plan=training_plan,
+                data_splitter=datamodule,
+                max_epochs=max_epochs,
+                accelerator=accelerator,
+                devices=devices,
+                early_stopping=early_stopping,
+                check_val_every_n_epoch=check_val_every_n_epoch,
+                early_stopping_monitor="reconstruction_loss_validation",
+                early_stopping_patience=50,
+                **kwargs,
+            )
+            return runner()
 
         datasplitter_kwargs = datasplitter_kwargs or {}
 

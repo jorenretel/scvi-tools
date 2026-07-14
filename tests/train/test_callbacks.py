@@ -265,3 +265,95 @@ def test_lightning_checkpoint(model_cls):
     assert "optimizer_states" in ckpt
     assert "lr_schedulers" in ckpt
     assert "state_dict" in ckpt
+
+
+@pytest.mark.parametrize("model_cls", [SCVI, MULTIVI])
+def test_user_modelcheckpoint_suppresses_auto_savecheckpoint(model_cls):
+    """A user-provided plain ModelCheckpoint suppresses the auto-injected SaveCheckpoint."""
+    if model_cls == SCVI:
+        adata = synthetic_iid()
+        model_cls.setup_anndata(adata, batch_key="batch")
+    else:
+        adata = synthetic_iid(return_mudata=True)
+        model_cls.setup_mudata(
+            adata,
+            batch_key="batch",
+            modalities={
+                "rna_layer": "rna",
+                "atac_layer": "accessibility",
+                "protein_layer": "protein_expression",
+            },
+        )
+    model = model_cls(adata)
+
+    ckpt_cb = ModelCheckpoint(monitor="elbo_validation", mode="min", save_top_k=1)
+    model.train(
+        max_epochs=1,
+        check_val_every_n_epoch=1,
+        callbacks=[ckpt_cb],
+        enable_checkpointing=True,
+    )
+
+    model_checkpoints = [
+        c for c in model.trainer.callbacks if isinstance(c, ModelCheckpoint)
+    ]
+    # Only the user-provided ModelCheckpoint should be present; no auto SaveCheckpoint.
+    assert model_checkpoints == [ckpt_cb]
+    assert not any(isinstance(c, SaveCheckpoint) for c in model.trainer.callbacks)
+
+
+@pytest.mark.parametrize("model_cls", [SCVI, MULTIVI])
+def test_savecheckpoint_resume_training(model_cls, save_path: str):
+    """Test that SaveCheckpoint preserves optimizer state for training resumption."""
+    scvi.settings.logging_dir = os.path.join(save_path, "resume_training")
+    rmtree(scvi.settings.logging_dir, ignore_errors=True)
+    os.makedirs(scvi.settings.logging_dir, exist_ok=True)
+
+    if model_cls == SCVI:
+        adata = synthetic_iid()
+        model_cls.setup_anndata(adata, batch_key="batch")
+    else:
+        adata = synthetic_iid(return_mudata=True)
+        model_cls.setup_mudata(
+            adata,
+            batch_key="batch",
+            modalities={
+                "rna_layer": "rna",
+                "atac_layer": "accessibility",
+                "protein_layer": "protein_expression",
+            },
+        )
+    model = model_cls(adata)
+
+    # Train with SaveCheckpoint callback
+    ckpt_cb = SaveCheckpoint(
+        monitor="elbo_validation",
+        mode="min",
+        save_top_k=1,
+    )
+    model.train(
+        max_epochs=2,
+        check_val_every_n_epoch=1,
+        callbacks=[ckpt_cb],
+    )
+
+    # Verify the .ckpt file exists alongside the model directory
+    assert os.path.exists(ckpt_cb.best_model_path)
+    assert os.path.isdir(ckpt_cb.best_model_path)
+
+    ckpt_file = ckpt_cb.best_ckpt_path
+    assert os.path.exists(ckpt_file)
+    assert ckpt_file.endswith(".ckpt")
+
+    # Verify the checkpoint contains optimizer state
+    ckpt = torch.load(ckpt_file, weights_only=False)
+    assert "optimizer_states" in ckpt
+    assert "state_dict" in ckpt
+
+    # Resume training from the checkpoint
+    model.train(
+        max_epochs=4,
+        check_val_every_n_epoch=1,
+        callbacks=[ckpt_cb],
+        ckpt_path=ckpt_file,
+    )

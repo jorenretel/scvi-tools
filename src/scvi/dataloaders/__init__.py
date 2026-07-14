@@ -7,6 +7,7 @@ from ._concat_dataloader import ConcatDataLoader
 from ._custom_dataloaders import (
     AnnbatchDataModule,
     MappedCollectionDataModule,
+    MappedCollectionMultiVIDataModule,
     TileDBDataModule,
 )
 from ._data_splitting import (
@@ -29,5 +30,6 @@ __all__ = [
     "BatchDistributedSampler",
     "AnnbatchDataModule",
     "MappedCollectionDataModule",
+    "MappedCollectionMultiVIDataModule",
     "TileDBDataModule",
 ]

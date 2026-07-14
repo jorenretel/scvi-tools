@@ -435,6 +435,296 @@ class MappedCollectionDataModule(LightningDataModule):
             return len(self.dataloader)
 
 
+class MappedCollectionMultiVIDataModule(LightningDataModule):
+    """LaminDB-backed DataModule for training MULTIVI models.
+
+    Streams data from a LaminDB Collection of AnnData artifacts where RNA and ATAC
+    features are concatenated along the variable axis (RNA first, then ATAC).
+    The ``feature_type`` column in ``.var`` distinguishes modalities.
+
+    Parameters
+    ----------
+    collection
+        A LaminDB Collection containing AnnData artifacts with concatenated
+        RNA + ATAC features in ``.X``.
+    n_genes
+        Number of RNA gene features (first ``n_genes`` columns of ``.X``).
+    n_regions
+        Number of ATAC region features (next ``n_regions`` columns after genes).
+    batch_key
+        Key in ``.obs`` used as the batch variable for MULTIVI.
+    categorical_covariate_keys
+        Additional categorical covariate keys from ``.obs``.
+    batch_size
+        Minibatch size for training.
+    train_size
+        Fraction of data used for training when ``collection_val`` is not provided.
+        The remaining fraction is used for validation. Set to 1.0 to disable splitting.
+    seed
+        Random seed for reproducible train/validation splitting.
+    collection_val
+        Optional separate collection for validation. When provided, ``train_size``
+        is ignored and the full ``collection`` is used for training.
+    accelerator
+        Lightning accelerator string.
+    device
+        Device specification.
+    shuffle
+        Whether to shuffle training data.
+    **kwargs
+        Additional keyword arguments passed to ``collection.mapped()``.
+    """
+
+    @dependencies("lamindb")
+    def __init__(
+        self,
+        collection: ln.Collection,
+        n_genes: int,
+        n_regions: int,
+        batch_key: str,
+        categorical_covariate_keys: list[str] | None = None,
+        batch_size: int = 128,
+        train_size: float = 0.9,
+        seed: int = 0,
+        collection_val: ln.Collection | None = None,
+        accelerator: str = "auto",
+        device: int | str = "auto",
+        shuffle: bool = True,
+        **kwargs,
+    ):
+        super().__init__()
+        self._n_genes = n_genes
+        self._n_regions = n_regions
+        self._batch_size = batch_size
+        self._batch_key = batch_key
+        self._categorical_covariate_keys = categorical_covariate_keys
+        self.shuffle = shuffle
+        self._parallel = kwargs.pop("parallel", True)
+
+        obs_keys = [batch_key]
+        if categorical_covariate_keys is not None:
+            obs_keys = obs_keys + categorical_covariate_keys
+
+        self._dataset = collection.mapped(
+            obs_keys=obs_keys, parallel=self._parallel, **kwargs
+        )
+
+        # Handle train/val splitting
+        if collection_val is not None:
+            # Use separate collection for validation
+            self._validset = collection_val.mapped(
+                obs_keys=obs_keys, parallel=self._parallel, **kwargs
+            )
+            self._train_indices = None
+            self._val_indices = None
+        elif train_size < 1.0:
+            # Random split of the single collection
+            n = self._dataset.n_obs
+            rng = np.random.default_rng(seed)
+            indices = rng.permutation(n)
+            n_train = int(n * train_size)
+            self._train_indices = indices[:n_train]
+            self._val_indices = indices[n_train:]
+            self._validset = None
+        else:
+            # No validation
+            self._validset = None
+            self._train_indices = None
+            self._val_indices = None
+
+        if categorical_covariate_keys is not None:
+            self._categorical_covariate_encoders = [
+                self._dataset.encoders[key] for key in categorical_covariate_keys
+            ]
+
+        self._log_hyperparams = False
+        self.allow_zero_length_dataloader_with_multiple_devices = False
+        _, _, self.device = parse_device_args(
+            accelerator=accelerator, devices=device, return_device="torch"
+        )
+
+    def close(self):
+        self._dataset.close()
+        if self._validset is not None:
+            self._validset.close()
+
+    def train_dataloader(self) -> DataLoader:
+        dataset = self._dataset
+        if self._train_indices is not None:
+            dataset = dataset[self._train_indices]
+        return self._create_dataloader(dataset, shuffle=self.shuffle)
+
+    def val_dataloader(self) -> DataLoader | None:
+        if self._validset is not None:
+            return self._create_dataloader(self._validset, shuffle=False)
+        if self._val_indices is not None:
+            dataset = self._dataset[self._val_indices]
+            return self._create_dataloader(dataset, shuffle=False)
+        return None
+
+    def _create_dataloader(self, dataset, shuffle: bool, batch_size: int | None = None):
+        num_workers = scvi.settings.dl_num_workers
+        if num_workers > 0 and self._parallel:
+            worker_init_fn = dataset.torch_worker_init_fn
+        else:
+            worker_init_fn = None
+        return DataLoader(
+            dataset,
+            batch_size=batch_size or self._batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            worker_init_fn=worker_init_fn,
+        )
+
+    def on_before_batch_transfer(self, batch, dataloader_idx):
+        x_full = batch["X"].float()
+        x_rna = x_full[:, : self._n_genes]
+        x_atac = x_full[:, self._n_genes : self._n_genes + self._n_regions]
+
+        batch_index = batch[self._batch_key][:, None] if self._batch_key else None
+
+        cat_covs = None
+        if self._categorical_covariate_keys is not None:
+            cat_covs = torch.cat(
+                [batch[k][:, None] for k in self._categorical_covariate_keys], dim=1
+            )
+
+        batch_size = x_rna.shape[0]
+        return {
+            "X": x_rna,
+            "atac": x_atac,
+            "batch": batch_index,
+            "labels": torch.zeros(batch_size, 1, dtype=torch.long),
+            "ind_x": torch.arange(batch_size),
+            "extra_categorical_covs": cat_covs,
+            "extra_continuous_covs": None,
+            "size_factor": None,
+            "proteins": torch.zeros(batch_size, 0),
+        }
+
+    @property
+    def n_obs(self) -> int:
+        return self._dataset.n_obs
+
+    @property
+    def n_vars(self) -> int:
+        return self._dataset.n_vars
+
+    @property
+    def n_genes(self) -> int:
+        return self._n_genes
+
+    @property
+    def n_regions(self) -> int:
+        return self._n_regions
+
+    @property
+    def n_batch(self) -> int:
+        return len(self._dataset.encoders[self._batch_key])
+
+    @property
+    def n_cats_per_cov(self) -> list[int] | None:
+        if self._categorical_covariate_keys is None:
+            return None
+        return [len(enc) for enc in self._categorical_covariate_encoders]
+
+    @property
+    def registry(self) -> dict:
+        return {
+            "scvi_version": scvi.__version__,
+            "model_name": "MULTIVI",
+            "setup_args": {
+                "batch_key": self._batch_key,
+                "categorical_covariate_keys": self._categorical_covariate_keys,
+            },
+            "field_registries": {
+                "X": {
+                    "data_registry": {"attr_name": "X", "attr_key": None},
+                    "state_registry": {
+                        "n_obs": self.n_obs,
+                        "n_vars": self._n_genes,
+                        "column_names": list(range(self._n_genes)),
+                    },
+                    "summary_stats": {"n_vars": self._n_genes, "n_cells": self.n_obs},
+                },
+                "atac": {
+                    "data_registry": {"attr_name": "X", "attr_key": None},
+                    "state_registry": {
+                        "n_obs": self.n_obs,
+                        "n_vars": self._n_regions,
+                    },
+                    "summary_stats": {"n_vars": self._n_regions},
+                },
+                "batch": {
+                    "data_registry": {"attr_name": "obs", "attr_key": "_scvi_batch"},
+                    "state_registry": {
+                        "categorical_mapping": list(
+                            self._dataset.encoders[self._batch_key].keys()
+                        ),
+                        "original_key": self._batch_key,
+                    },
+                    "summary_stats": {"n_batch": self.n_batch},
+                },
+                "labels": {
+                    "data_registry": {"attr_name": "obs", "attr_key": "_scvi_labels"},
+                    "state_registry": {"categorical_mapping": None, "original_key": None},
+                    "summary_stats": {"n_labels": 1},
+                },
+                "ind_x": {
+                    "data_registry": {"attr_name": "obs", "attr_key": "_indices"},
+                    "state_registry": {},
+                    "summary_stats": {},
+                },
+                "extra_categorical_covs": {
+                    "data_registry": (
+                        {"attr_key": "_scvi_extra_categorical_covs", "attr_name": "obsm"}
+                        if self._categorical_covariate_keys
+                        else {}
+                    ),
+                    "state_registry": (
+                        {
+                            "field_keys": self._categorical_covariate_keys,
+                            "n_cats_per_key": self.n_cats_per_cov,
+                        }
+                        if self._categorical_covariate_keys
+                        else {}
+                    ),
+                    "summary_stats": {
+                        "n_extra_categorical_covs": len(self._categorical_covariate_keys)
+                        if self._categorical_covariate_keys
+                        else 0
+                    },
+                },
+                "extra_continuous_covs": {
+                    "data_registry": {},
+                    "state_registry": {},
+                    "summary_stats": {"n_extra_continuous_covs": 0},
+                },
+                "size_factor": {"data_registry": {}, "state_registry": {}, "summary_stats": {}},
+            },
+            "setup_method_name": "setup_datamodule",
+        }
+
+    def inference_dataloader(self, batch_size: int = 4096, shuffle: bool = False):
+        """Dataloader for inference with ``on_before_batch_transfer`` applied."""
+        dataloader = self._create_dataloader(self._dataset, shuffle=shuffle, batch_size=batch_size)
+        return self._InferenceDataloader(dataloader, self.on_before_batch_transfer)
+
+    class _InferenceDataloader:
+        """Wrapper to apply ``on_before_batch_transfer`` during iteration."""
+
+        def __init__(self, dataloader, transform_fn):
+            self.dataloader = dataloader
+            self.transform_fn = transform_fn
+
+        def __iter__(self):
+            for batch in self.dataloader:
+                yield self.transform_fn(batch, dataloader_idx=None)
+
+        def __len__(self):
+            return len(self.dataloader)
+
+
 class TileDBDataModule(LightningDataModule):
     """PyTorch Lightning DataModule for training scVI models from SOMA data
 

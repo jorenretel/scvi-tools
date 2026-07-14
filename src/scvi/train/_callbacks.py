@@ -124,14 +124,35 @@ class SaveCheckpoint(ModelCheckpoint):
     def _remove_checkpoint(self, trainer: pl.Trainer, filepath: str) -> None:
         """Removes model saves that are no longer needed.
 
-        Calls the superclass method and then removes the :class:`~scvi.model.base.BaseModelClass`
-        save directory.
+        Removes both the Lightning checkpoint file (including optimizer state) and the
+        :class:`~scvi.model.base.BaseModelClass` save directory.
         """
-        super()._remove_checkpoint(trainer, filepath)
+        # Determine the base path (without .ckpt extension)
+        if filepath.endswith(".ckpt"):
+            model_path = filepath[: -len(".ckpt")]
+            ckpt_path = filepath
+        else:
+            model_path = filepath
+            ckpt_path = filepath + ".ckpt"
 
-        model_path = filepath.split(".ckpt")[0]
+        # Remove the Lightning .ckpt file
+        if os.path.exists(ckpt_path) and os.path.isfile(ckpt_path):
+            os.remove(ckpt_path)
+
+        # Remove the scvi model directory
         if os.path.exists(model_path) and os.path.isdir(model_path):
             rmtree(model_path)
+
+    @property
+    def best_ckpt_path(self) -> str:
+        """Path to the best Lightning checkpoint file (including optimizer state).
+
+        Use this path with ``ckpt_path`` in :meth:`~scvi.model.base.BaseModelClass.train` to
+        resume training with the optimizer state preserved.
+        """
+        if self.best_model_path and not self.best_model_path.endswith(".ckpt"):
+            return self.best_model_path + ".ckpt"
+        return self.best_model_path
 
     def _update_best_and_save(
         self,
@@ -139,16 +160,16 @@ class SaveCheckpoint(ModelCheckpoint):
         trainer: pl.Trainer,
         monitor_candidates: dict[str, torch.Tensor],
     ) -> None:
-        """Replaces Lightning checkpoints with :class:`~scvi.model.base.BaseModelClass` saves.
+        """Saves :class:`~scvi.model.base.BaseModelClass` alongside Lightning checkpoints.
 
-        Calls the superclass method and then replaces the Lightning checkpoint file with
-        the :class:`~scvi.model.base.BaseModelClass` save directory.
+        Calls the superclass method to save the Lightning checkpoint (including optimizer state),
+        then updates ``best_model_path`` to point to the scvi model directory while preserving
+        the ``.ckpt`` file for training resumption.
         """
         super()._update_best_and_save(current, trainer, monitor_candidates)
 
-        if os.path.exists(self.best_model_path):
-            os.remove(self.best_model_path)
-        self.best_model_path = self.best_model_path.split(".ckpt")[0]
+        if self.best_model_path.endswith(".ckpt"):
+            self.best_model_path = self.best_model_path[: -len(".ckpt")]
 
     def on_train_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         """Loads the best model state into the model at the end of training."""
