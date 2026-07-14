@@ -4,7 +4,7 @@ from typing import Literal
 
 import lightning.pytorch as pl
 from lightning.pytorch.accelerators import Accelerator
-from lightning.pytorch.callbacks import LearningRateMonitor
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import Logger
 
 from scvi import settings
@@ -153,11 +153,11 @@ class Trainer(pl.Trainer):
             if user_check_val_every_n_epoch is None:
                 check_val_every_n_epoch = 1
 
-        if enable_checkpointing and not any(isinstance(c, SaveCheckpoint) for c in callbacks):
+        if enable_checkpointing and not any(isinstance(c, ModelCheckpoint) for c in callbacks):
             callbacks.append(SaveCheckpoint(monitor=checkpointing_monitor))
             if user_check_val_every_n_epoch is None:
                 check_val_every_n_epoch = 1
-        elif any(isinstance(c, SaveCheckpoint) for c in callbacks):
+        elif any(isinstance(c, ModelCheckpoint) for c in callbacks):
             # check if the user provided already provided the callback
             enable_checkpointing = True
             if user_check_val_every_n_epoch is None:
